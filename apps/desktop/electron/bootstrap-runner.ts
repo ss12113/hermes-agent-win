@@ -49,9 +49,58 @@ const IS_WINDOWS = process.platform === 'win32'
 const STAMP_COMMIT_RE = /^[0-9a-f]{7,40}$/i
 const FALLBACK_COMMIT_RE = /^0{7,40}$/
 const FALLBACK_BRANCH = 'main'
+const UPSTREAM_REPO = 'NousResearch/hermes-agent'
+// owner/name only: a stray path, URL or whitespace must never reach the raw URL.
+const REPO_SHAPE_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
 
 function isPinnedCommit(commit) {
   return typeof commit === 'string' && STAMP_COMMIT_RE.test(commit) && !FALLBACK_COMMIT_RE.test(commit)
+}
+
+/**
+ * Where bootstrap fetches install.ps1 from, and which ref it follows.
+ *
+ * Upstream ships neither knob, so its packaged-commit/branch policy is
+ * untouched. A distribution that publishes its own installer drops
+ * `bootstrap-source.json` (`{ "repo": "owner/name", "ref": "main" }`) beside
+ * the app's resources, or exports HERMES_BOOTSTRAP_REPO / HERMES_BOOTSTRAP_REF.
+ * With an override active the packaged commit pin is dropped: a fork's
+ * snapshot history does not carry upstream commit ids, and install.ps1 fails
+ * closed when -Commit is not an ancestor of -Branch.
+ */
+function bootstrapSourceOverride(
+  opts: { resourcesPath?: string | null; env?: Record<string, string | undefined> } = {}
+): { repo: string; ref: string | null } | null {
+  const env = opts.env || process.env
+  const envRepo = String(env.HERMES_BOOTSTRAP_REPO || '').trim()
+  const envRef = String(env.HERMES_BOOTSTRAP_REF || '').trim()
+
+  if (envRepo) {
+    return REPO_SHAPE_RE.test(envRepo) ? { repo: envRepo, ref: envRef || null } : null
+  }
+
+  const base = opts.resourcesPath || process.resourcesPath
+
+  if (!base) {
+    return null
+  }
+
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(base, 'bootstrap-source.json'), 'utf8'))
+    const repo = parsed && typeof parsed.repo === 'string' ? parsed.repo.trim() : ''
+
+    if (REPO_SHAPE_RE.test(repo)) {
+      const ref = typeof parsed.ref === 'string' ? parsed.ref.trim() : ''
+
+      return { repo, ref: ref || null }
+    }
+  } catch {
+    // No override shipped (every upstream build) or an unreadable file: fall
+    // back to the packaged commit/branch policy.
+    void 0
+  }
+
+  return null
 }
 
 type ExecGitFn = (args: string[], cwd: string) => string
@@ -224,12 +273,13 @@ function cachedScriptPath(hermesHome, cacheKey) {
   return path.join(bootstrapCacheDir(hermesHome), `install-${cacheKey}.${process.platform === 'win32' ? 'ps1' : 'sh'}`)
 }
 
-function downloadInstallScript(ref, destPath) {
+function downloadInstallScript(ref, destPath, source: { repo: string } | null = null) {
   // Fetch from GitHub raw at the install ref: the packaged SHA for a fresh
   // install, the branch for an existing checkout or a non-git fallback stamp
-  // (never the all-zero placeholder, which is not a real GitHub commit).
+  // (never the all-zero placeholder, which is not a real GitHub commit). A
+  // distribution override redirects the repo, never the ref policy.
   const scriptName = installScriptName()
-  const url = `https://raw.githubusercontent.com/NousResearch/hermes-agent/${ref}/scripts/${scriptName}`
+  const url = `https://raw.githubusercontent.com/${source ? source.repo : UPSTREAM_REPO}/${ref}/scripts/${scriptName}`
 
   return new Promise((resolve, reject) => {
     fs.mkdirSync(path.dirname(destPath), { recursive: true })
@@ -331,8 +381,20 @@ async function resolveInstallScript({
 
   // 2. Packaged path: download using the same identity policy as the stages.
   // Fresh installs use the packaged commit; existing checkouts and non-git
-  // fallback builds follow the branch.
-  const installRef = installRefForStamp(installStamp, { pinCommit })
+  // fallback builds follow the branch. A distribution override replaces that
+  // policy with the fork's own repo + ref.
+  const source = bootstrapSourceOverride()
+
+  const installRef = source
+    ? {
+        ref: source.ref || (installRefForStamp(installStamp, { pinCommit }) || { ref: FALLBACK_BRANCH }).ref,
+        cacheKey: `source-${source.repo.replace(/[^0-9A-Za-z._-]/g, '_')}-${(source.ref || 'auto').replace(
+          /[^0-9A-Za-z._-]/g,
+          '_'
+        )}`,
+        pinned: false
+      }
+    : installRefForStamp(installStamp, { pinCommit })
 
   if (!installRef) {
     throw new Error(
@@ -351,10 +413,11 @@ async function resolveInstallScript({
     type: 'log',
     line:
       `[bootstrap] fetching ${installScriptName()} for ${installRef.ref.slice(0, 12)} from GitHub` +
+      (source ? ` (${source.repo})` : '') +
       (installRef.pinned ? '' : ' (unpinned branch)')
   })
 
-  await _download(installRef.ref, cached)
+  await _download(installRef.ref, cached, source)
   emit({ type: 'log', line: `[bootstrap] saved to ${cached}` })
 
   return { path: cached, source: 'download', commit: resolvedCommit, kind: installScriptKind() }
@@ -430,10 +493,21 @@ function cleanInstallerLogLine(raw: string): string {
 // when it is new enough), so store dirs already on PATH stay ahead of the
 // login-shell entries shell-path.ts merged in front of them.
 function installerEnv(hermesHome) {
-  const env = { ...process.env, HERMES_HOME: hermesHome || process.env.HERMES_HOME || '' }
+  const env: Record<string, any> = { ...process.env, HERMES_HOME: hermesHome || process.env.HERMES_HOME || '' }
   const key = pathEnvKey(env)
 
   env[key] = storeFirstPath(env[key] || '', { currentEnv: env })
+
+  // A distribution override owns the clone target too. The install script we
+  // fetched can default to upstream (a fork usually keeps scripts/install.*
+  // byte-identical), so name the repo explicitly: fetch and clone stay on the
+  // same source, and an existing checkout's origin is re-pointed at it. An
+  // operator-set HERMES_REPO_URL still wins.
+  const source = bootstrapSourceOverride()
+
+  if (source && !env.HERMES_REPO_URL) {
+    env.HERMES_REPO_URL = `https://github.com/${source.repo}.git`
+  }
 
   return env
 }
@@ -913,7 +987,26 @@ async function runBootstrap(opts) {
 
   try {
     const existingCheckout = hasExistingGitCheckout(activeRoot)
-    const pinCommit = !existingCheckout
+    const source = bootstrapSourceOverride()
+    // A distribution override owns the ref, so the packaged commit pin is
+    // dropped: a fork's snapshot history has no upstream commit ids, and
+    // install.ps1 fails closed when -Commit is not an ancestor of -Branch.
+    const pinCommit = !existingCheckout && !source
+
+    const stageStamp = source
+      ? {
+          ...(installStamp || {}),
+          commit: null,
+          branch: source.ref || (installStamp && installStamp.branch) || FALLBACK_BRANCH
+        }
+      : installStamp
+
+    if (source) {
+      emit({
+        type: 'log',
+        line: `[bootstrap] distribution source override: ${source.repo} @ ${stageStamp.branch}`
+      })
+    }
 
     if (existingCheckout && installStamp && installStamp.commit) {
       emit({
@@ -925,7 +1018,14 @@ async function runBootstrap(opts) {
     }
 
     // 1. Resolve the platform installer.
-    const scriptInfo = await resolveInstallScript({ installStamp, sourceRepoRoot, hermesHome, emit, pinCommit })
+    const scriptInfo = await resolveInstallScript({
+      installStamp: stageStamp,
+      sourceRepoRoot,
+      hermesHome,
+      emit,
+      pinCommit
+    })
+
     abortSignal?.throwIfAborted()
 
     const installerKind = scriptInfo.kind || 'powershell'
@@ -937,7 +1037,7 @@ async function runBootstrap(opts) {
       emit,
       hermesHome,
       activeRoot,
-      installStamp,
+      installStamp: stageStamp,
       pinCommit,
       abortSignal
     })
@@ -969,7 +1069,7 @@ async function runBootstrap(opts) {
         hermesHome,
         activeRoot,
         abortSignal,
-        installStamp,
+        installStamp: stageStamp,
         pinCommit
       })
 
@@ -984,7 +1084,7 @@ async function runBootstrap(opts) {
     // not real pins -- resolve HEAD from the checkout we just installed so
     // isBootstrapComplete() (pinnedCommit.length >= 7) accepts the marker
     // instead of re-running bootstrap on every launch (#50823 review).
-    const pinnedCommit = resolveMarkerPinnedCommit(installStamp, activeRoot, {
+    const pinnedCommit = resolveMarkerPinnedCommit(stageStamp, activeRoot, {
       resolveHead: root => resolveCheckoutHead(root, { gitBinary })
     })
 
@@ -1004,7 +1104,7 @@ async function runBootstrap(opts) {
 
     const markerPayload = {
       pinnedCommit,
-      pinnedBranch: installStamp ? installStamp.branch : null
+      pinnedBranch: stageStamp ? stageStamp.branch : null
     }
 
     const marker = typeof writeMarker === 'function' ? writeMarker(markerPayload) : markerPayload
@@ -1031,11 +1131,13 @@ async function runBootstrap(opts) {
 }
 
 export {
+  bootstrapSourceOverride,
   buildPinArgs,
   buildPosixPinArgs,
   cachedScriptPath,
   cleanInstallerLogLine,
   hasExistingGitCheckout,
+  installerEnv,
   installRefForStamp,
   isPinnedCommit,
   // Exposed for testability

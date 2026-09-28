@@ -6,11 +6,13 @@ import path from 'node:path'
 import { test } from 'vitest'
 
 import {
+  bootstrapSourceOverride,
   buildPinArgs,
   buildPosixPinArgs,
   cachedScriptPath,
   cleanInstallerLogLine,
   hasExistingGitCheckout,
+  installerEnv,
   installRefForStamp,
   isPinnedCommit,
   resolveInstallScript,
@@ -319,3 +321,111 @@ test.skipIf(process.platform === 'win32')(
     assert.equal(result.error, 'install.sh --manifest failed: exit 3\n✗ manifest broke')
   }
 )
+
+test('bootstrapSourceOverride reads the env then the resources file, and rejects non-repo shapes', () => {
+  const home = mkTmpHome()
+
+  try {
+    assert.equal(bootstrapSourceOverride({ resourcesPath: home, env: {} }), null)
+
+    fs.writeFileSync(path.join(home, 'bootstrap-source.json'), JSON.stringify({ repo: 'octo/fork', ref: 'main' }))
+    assert.deepEqual(bootstrapSourceOverride({ resourcesPath: home, env: {} }), { repo: 'octo/fork', ref: 'main' })
+
+    // A URL, path or free text must never reach the raw.githubusercontent host.
+    fs.writeFileSync(
+      path.join(home, 'bootstrap-source.json'),
+      JSON.stringify({ repo: 'https://evil.example.com/x', ref: 'main' })
+    )
+    assert.equal(bootstrapSourceOverride({ resourcesPath: home, env: {} }), null)
+
+    // The environment outranks the shipped file.
+    assert.deepEqual(bootstrapSourceOverride({ resourcesPath: home, env: { HERMES_BOOTSTRAP_REPO: 'octo/other' } }), {
+      repo: 'octo/other',
+      ref: null
+    })
+    assert.equal(bootstrapSourceOverride({ resourcesPath: home, env: { HERMES_BOOTSTRAP_REPO: 'not a repo' } }), null)
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('resolveInstallScript follows the distribution override instead of the packaged pin', async () => {
+  const home = mkTmpHome()
+  const prevRepo = process.env.HERMES_BOOTSTRAP_REPO
+  const prevRef = process.env.HERMES_BOOTSTRAP_REF
+
+  try {
+    process.env.HERMES_BOOTSTRAP_REPO = 'octo/fork'
+    process.env.HERMES_BOOTSTRAP_REF = 'main'
+
+    const cached = cachedScriptPath(home, 'source-octo_fork-main')
+    const refs: string[] = []
+    const sources: ({ repo: string } | null | undefined)[] = []
+
+    const result = await resolveInstallScript({
+      // A packaged pin that the fork's snapshot history cannot contain.
+      installStamp: { commit: 'b'.repeat(40), branch: 'carried-branch' },
+      sourceRepoRoot: null,
+      hermesHome: home,
+      emit: () => {},
+      _download: async (ref, destPath, source) => {
+        refs.push(ref)
+        sources.push(source)
+        fs.mkdirSync(path.dirname(destPath), { recursive: true })
+        fs.writeFileSync(destPath, '#!/bin/sh\necho fork installer\n')
+
+        return destPath
+      }
+    })
+
+    assert.deepEqual(refs, ['main'])
+    assert.deepEqual(sources, [{ repo: 'octo/fork', ref: 'main' }])
+    assert.equal(result.commit, null)
+    assert.equal(result.path, cached)
+  } finally {
+    if (prevRepo === undefined) {
+      delete process.env.HERMES_BOOTSTRAP_REPO
+    } else {
+      process.env.HERMES_BOOTSTRAP_REPO = prevRepo
+    }
+
+    if (prevRef === undefined) {
+      delete process.env.HERMES_BOOTSTRAP_REF
+    } else {
+      process.env.HERMES_BOOTSTRAP_REF = prevRef
+    }
+
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('installerEnv points HERMES_REPO_URL at the override repo unless the operator set one', () => {
+  const prevRepo = process.env.HERMES_BOOTSTRAP_REPO
+  const prevUrl = process.env.HERMES_REPO_URL
+
+  try {
+    delete process.env.HERMES_REPO_URL
+    process.env.HERMES_BOOTSTRAP_REPO = 'octo/fork'
+    assert.equal(installerEnv('/tmp/hermes-installer-env').HERMES_REPO_URL, 'https://github.com/octo/fork.git')
+
+    // Explicit operator configuration outranks the shipped override.
+    process.env.HERMES_REPO_URL = 'https://github.com/other/thing.git'
+    assert.equal(installerEnv('/tmp/hermes-installer-env').HERMES_REPO_URL, 'https://github.com/other/thing.git')
+
+    delete process.env.HERMES_BOOTSTRAP_REPO
+    delete process.env.HERMES_REPO_URL
+    assert.equal(installerEnv('/tmp/hermes-installer-env').HERMES_REPO_URL, undefined)
+  } finally {
+    if (prevRepo === undefined) {
+      delete process.env.HERMES_BOOTSTRAP_REPO
+    } else {
+      process.env.HERMES_BOOTSTRAP_REPO = prevRepo
+    }
+
+    if (prevUrl === undefined) {
+      delete process.env.HERMES_REPO_URL
+    } else {
+      process.env.HERMES_REPO_URL = prevUrl
+    }
+  }
+})

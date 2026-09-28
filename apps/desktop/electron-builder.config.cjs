@@ -126,6 +126,12 @@ module.exports = {
       from: 'build/install-stamp.json',
       to: 'install-stamp.json'
     },
+    // Distribution builds may ship a bootstrap-source.json (repo + ref) so the
+    // packaged app installs that fork's tree instead of upstream's. Upstream
+    // builds carry no such file and keep the packaged commit/branch policy.
+    ...(fs.existsSync(path.join(__dirname, 'build', 'bootstrap-source.json'))
+      ? [{ from: 'build/bootstrap-source.json', to: 'bootstrap-source.json' }]
+      : []),
     ...(['bundled', 'store'].includes(process.env.HERMES_DESKTOP_VARIANT || '')
       ? [{ from: 'build/agent-payload', to: 'agent-payload' }]
       : []),
