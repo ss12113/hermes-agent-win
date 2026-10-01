@@ -705,10 +705,21 @@ function Fail([string]$msg) {
     throw $msg
 }
 
+function ConvertTo-AsciiJson($Value, [int]$Depth = 4) {
+    # JSON with every non-ASCII character \u-escaped. Windows PowerShell 5.1
+    # re-encodes CJK through the console code page on the way out; one byte of
+    # a multi-byte character can land on a backslash inside a string, and the
+    # frame then fails to parse in the driver -- which reports "no JSON result
+    # frame" instead of the real reason. Pure-ASCII frames decode the same
+    # everywhere.
+    $json = $Value | ConvertTo-Json -Compress -Depth $Depth
+    return [regex]::Replace($json, '[^\x00-\x7F]', { param($m) '\u{0:x4}' -f [int][char]$m.Value })
+}
+
 function Emit-Frame([bool]$ok, [string]$name, [bool]$skipped, [string]$reason = "") {
     $frame = [ordered]@{ ok = $ok; stage = $name; skipped = $skipped }
     if ($reason) { $frame.reason = $reason }
-    $frame | ConvertTo-Json -Compress | Write-Output
+    ConvertTo-AsciiJson $frame | Write-Output
 }
 
 $ProductTitle = if ($IncludeDesktop) { "Install command and app + desktop" } else { "Install command and app" }
@@ -896,6 +907,37 @@ function Stage-Venv {
     Write-Ok "bootstrap Python ready; PM prepares the dependency environment"
 }
 
+function Get-ManagedPythonPath([string]$uv, [string]$pyRequest) {
+    # uv names the pinned interpreter on stdout as UTF-8. Windows PowerShell
+    # 5.1 captures that through the console code page -- GBK on zh-CN hosts --
+    # so a profile path with non-ASCII characters (C:\Users\李文杰\...) comes
+    # back as mojibake that can never be launched. When the captured text does
+    # not name an existing file, re-run the lookup with stdout decoded as
+    # UTF-8 explicitly.
+    $path = ((Invoke-Native { & $uv python find --managed-python --no-project $pyRequest 2>$null }) -join "`n").Trim()
+    if ($path -and (Test-Path -LiteralPath $path -PathType Leaf)) { return $path }
+
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $uv
+        $psi.Arguments = "python find --managed-python --no-project $pyRequest"
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $raw = $proc.StandardOutput.ReadToEnd().Trim()
+        $proc.StandardError.ReadToEnd() | Out-Null
+        $proc.WaitForExit()
+        if ($proc.ExitCode -eq 0 -and $raw -and (Test-Path -LiteralPath $raw -PathType Leaf)) { return $raw }
+    } catch {
+        # Fall through: '' tells the caller uv did not name a usable
+        # interpreter, and it moves on to install/reinstall.
+    }
+    return ''
+}
+
 # Delegate the whole python+venv+tools install to pm: stage the pinned uv,
 # let uv locate Python and exit before PM starts. PM provisions the interpreter,
 # the venv (default extras = [all], matching `hermes update`), and the
@@ -915,14 +957,14 @@ function Get-BootstrapPython {
     # A bare version lets uv pick emulated x86_64 on Windows-on-ARM.
     $pyArch = if ((Get-WindowsArch) -eq 'arm64') { 'aarch64' } else { 'x86_64' }
     $pyRequest = "cpython-$pyVersion-windows-$pyArch-none"
-    $bootPy = (Invoke-Native { & $uv python find --managed-python --no-project $pyRequest 2>$null }) -join "`n"
-    if ($LASTEXITCODE -or -not $bootPy) {
+    $bootPy = Get-ManagedPythonPath $uv $pyRequest
+    if (-not $bootPy) {
         Invoke-Logged "Downloading Python $pyVersion" { & $uv python install --no-bin --no-registry $pyRequest }
         if ($LASTEXITCODE) { Fail "bootstrap Python installation failed" }
-        $bootPy = (Invoke-Native { & $uv python find --managed-python --no-project $pyRequest }) -join "`n"
+        $bootPy = Get-ManagedPythonPath $uv $pyRequest
     }
-    if ($LASTEXITCODE -or -not $bootPy) { Fail "bootstrap Python lookup failed" }
-    $script:BootstrapPython = $bootPy.Trim()
+    if (-not $bootPy) { Fail "bootstrap Python lookup failed" }
+    $script:BootstrapPython = $bootPy
     return $script:BootstrapPython
 }
 
@@ -1236,6 +1278,14 @@ if ($script:IsDotSourced) {
 # The normalization prologue runs exactly once per real entry, before any
 # switch is honored, so every contract below sees long-form paths.
 Initialize-ResolvedPaths
+
+# Windows PowerShell 5.1 captures child-process output with the console code
+# page -- GBK on zh-CN hosts -- while the tools this installer drives (uv above
+# all) emit UTF-8. With a non-ASCII profile path (C:\Users\李文杰\AppData\...)
+# a captured path comes back as mojibake and `& $bootPy` can never launch the
+# interpreter it names. Force UTF-8 for this process before any child runs;
+# best-effort, because a host without a console can refuse the assignment.
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
 # Keep uv from discovering uv.toml / pyproject.toml config from whatever
 # directory or user profile the installer runs under (mirrors install.sh).
