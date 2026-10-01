@@ -777,8 +777,36 @@ function Stage-Repository {
         }
         # Explicit refspec: a tag-pinned --single-branch checkout from an older installer maps only
         # the tag, so a by-name fetch never writes the origin/$Branch used below (#125112).
-        Invoke-Logged "Fetching origin/$Branch" { git -C $InstallDir fetch origin "+refs/heads/${Branch}:refs/remotes/origin/${Branch}" }
-        if ($LASTEXITCODE) { Fail "git fetch failed" }
+        # git 2.53+ aborts fetches into a partial clone whose packs lack a .promisor marker
+        # (#124272), and an install stuck there never fetches the updater that heals it.
+        # Marking is idempotent and never rewrites objects.
+        $promisor = Invoke-Native { git -C $InstallDir config --bool --get remote.origin.promisor }
+        $packDir = Join-Path $InstallDir '.git\objects\pack'
+        if ("$promisor".Trim() -eq 'true' -and (Test-Path -LiteralPath $packDir)) {
+            Get-ChildItem -LiteralPath $packDir -Filter 'pack-*.pack' | ForEach-Object {
+                $marker = [IO.Path]::ChangeExtension($_.FullName, '.promisor')
+                if (-not (Test-Path -LiteralPath $marker)) {
+                    try { New-Item -ItemType File -Path $marker | Out-Null }
+                    catch { Write-Warn "could not mark $marker as a partial-clone pack" }
+                }
+            }
+        }
+        # Flaky links reset the connection mid-negotiation ("RPC failed; ...
+        # Connection was reset", "expected flush after ref listing"); a retry
+        # usually gets through. Attempts after the first pin HTTP/1.1, which
+        # rides out resets that kill an HTTP/2 handshake.
+        $fetchArgs = @('-C', $InstallDir, 'fetch', 'origin', "+refs/heads/${Branch}:refs/remotes/origin/${Branch}")
+        $fetchOk = $false
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+            if ($attempt -eq 1) {
+                Invoke-Logged "Fetching origin/$Branch" { git @fetchArgs }
+            } else {
+                Invoke-Logged "Fetching origin/$Branch (attempt $attempt of 3)" { git -c http.version=HTTP/1.1 @fetchArgs }
+            }
+            if (-not $LASTEXITCODE) { $fetchOk = $true; break }
+            if ($attempt -lt 3) { Start-Sleep -Seconds (2 * $attempt) }
+        }
+        if (-not $fetchOk) { Fail "git fetch failed" }
         $stamp = (Get-Date -Format 'yyyyMMdd-HHmmss')
         # Park local work BEFORE switching branches: checkout refuses a dirty
         # tree that conflicts, and the reset below would discard it. Work that
